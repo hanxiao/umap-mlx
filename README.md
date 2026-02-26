@@ -2,7 +2,7 @@
 
 UMAP in pure MLX for Apple Silicon. Entire pipeline runs on Metal GPU.
 
-20-40x faster than umap-learn. Fashion-MNIST 60K in 1.9 seconds.
+30-46x faster than umap-learn. Fashion-MNIST 70K in 2.6 seconds.
 
 ## Install
 
@@ -28,7 +28,7 @@ Parameters:
 - `n_neighbors`: k for k-NN graph (default 15)
 - `min_dist`: minimum distance in low-dim space (default 0.1)
 - `spread`: scale of embedded points (default 1.0)
-- `n_epochs`: optimization epochs (default 200)
+- `n_epochs`: optimization epochs (default: 500 for N<=10K, 200 for larger)
 - `learning_rate`: SGD learning rate (default 1.0)
 - `random_state`: seed for reproducibility
 - `verbose`: print progress
@@ -37,21 +37,21 @@ Parameters:
 
 ```
 N       umap-learn    MLX      speedup
-1000    4.88s         0.15s    32x
-2000    6.20s         0.16s    38x
-5000    17.18s        0.22s    77x
-10000   25.95s        0.32s    80x
-20000   22.12s        0.56s    40x
-60000   69.05s        2.26s    31x
+1000    4.87s         0.40s    12x
+2000    6.18s         0.36s    17x
+5000    17.22s        0.44s    40x
+10000   25.85s        0.56s    46x
+20000   22.01s        0.54s    41x
+60000   68.99s        2.04s    34x
+70000   81.40s        2.65s    31x
 ```
 
-Peak speedup at 5-10K (GPU parallelism sweet spot). At 60K the O(n^2) distance
-matrix (14GB) becomes memory-bandwidth bound. umap-learn uses approximate KNN
-(pynndescent) at large N, which has better asymptotic scaling.
+Bottleneck at large N is exact k-NN (O(n^2) pairwise distances). umap-learn
+uses approximate KNN (pynndescent) with better asymptotic scaling.
 
 ## Comparison
 
-Fashion-MNIST train (60,000 samples, 784 dims, 10 classes):
+Fashion-MNIST full (70,000 samples, 784 dims, 10 classes):
 
 ![comparison](comparison.png)
 
@@ -59,11 +59,12 @@ Fashion-MNIST created by Han Xiao et al.
 
 ## How it works
 
-1. Chunked pairwise distances + `mx.argpartition` for k-NN on Metal GPU
-2. Vectorized binary search for per-point sigma (all N points simultaneously)
-3. Sparse graph symmetrization + edge pruning (matches umap-learn)
-4. SGD on Metal GPU using `mx.array.at[].add()` for scatter accumulation
-5. Negative sampling with repulsive forces
+1. Chunked pairwise distances + `mx.argpartition` for exact k-NN on Metal GPU
+2. Vectorized binary search for per-point sigma (all N points simultaneously on GPU)
+3. Sparse graph symmetrization via GPU `_searchsorted` + edge pruning
+4. Spectral initialization via power iteration on normalized graph Laplacian
+5. Compiled SGD on Metal GPU with `mx.array.at[].add()` for scatter accumulation
+6. Negative sampling with repulsive forces
 
 Dependencies: `mlx` and `numpy` only. No scipy, no PyTorch.
 
