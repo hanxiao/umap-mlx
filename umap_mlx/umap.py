@@ -74,7 +74,8 @@ class UMAP:
             print("Optimizing embedding...")
         if self.random_state is not None:
             mx.random.seed(self.random_state)
-        Y = mx.random.normal((n, self.n_components)) * 0.01
+        # Use larger random init for large datasets
+        Y = mx.random.normal((n, self.n_components)) * (10.0 if n > 10000 else 0.01)
         mx.eval(Y)
 
         # Step 5: Optimize (pure MLX)
@@ -160,6 +161,10 @@ class UMAP:
 
         W_sym = W + W.T - W * W.T
 
+        # Prune weak edges (same as umap-learn)
+        max_val = W_sym.max()
+        W_sym[W_sym < max_val / self.n_epochs] = 0.0
+
         # Extract non-zero edges
         nz = np.nonzero(W_sym)
         return (
@@ -194,6 +199,39 @@ class UMAP:
                     best_a, best_b, best_err = a, b, err
 
         return float(best_a), float(best_b)
+
+    def _spectral_init(self, rows, cols, vals, n):
+        """Spectral initialization using normalized graph Laplacian."""
+        try:
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.linalg import eigsh
+
+            rows_np = np.array(rows)
+            cols_np = np.array(cols)
+            vals_np = np.array(vals)
+
+            W = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n)).tocsr()
+            # Normalized Laplacian: L = D^{-1/2} W D^{-1/2}
+            degrees = np.array(W.sum(axis=1)).flatten()
+            degrees = np.maximum(degrees, 1e-10)
+            D_inv_sqrt = 1.0 / np.sqrt(degrees)
+
+            # Compute eigenvectors of D^{-1/2} W D^{-1/2}
+            from scipy.sparse import diags
+            L_norm = diags(D_inv_sqrt) @ W @ diags(D_inv_sqrt)
+            _, eigvecs = eigsh(L_norm, k=self.n_components + 1, which='LM')
+            # Skip first eigenvector (constant), take next n_components
+            Y = eigvecs[:, 1:self.n_components + 1]
+            # Scale to unit variance
+            Y = Y / Y.std() * 0.0001
+
+            if self.verbose:
+                print("Using spectral initialization")
+            return mx.array(Y.astype(np.float32))
+        except Exception:
+            if self.verbose:
+                print("Spectral init failed, using random initialization")
+            return mx.random.normal((n, self.n_components)) * 0.01
 
     def _optimize(
         self, edge_from: mx.array, edge_to: mx.array, edge_weights: mx.array,
