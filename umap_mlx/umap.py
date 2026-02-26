@@ -4,6 +4,28 @@ import mlx.core as mx
 import numpy as np
 
 
+def _searchsorted(sorted_array: mx.array, values: mx.array) -> mx.array:
+    """Vectorized binary search on GPU (equivalent to np.searchsorted).
+
+    For each value in `values`, find the insertion index in `sorted_array`.
+    """
+    n = sorted_array.shape[0]
+    m = values.shape[0]
+    lo = mx.zeros((m,), dtype=mx.int32)
+    hi = mx.full((m,), n, dtype=mx.int32)
+
+    # ceil(log2(n)) iterations suffice
+    for _ in range(int(np.ceil(np.log2(max(n, 2)))) + 1):
+        mid = (lo + hi) // 2
+        # Clamp mid to valid range for indexing
+        mid_clamped = mx.minimum(mid, n - 1)
+        go_right = sorted_array[mid_clamped] < values
+        lo = mx.where(go_right, mid + 1, lo)
+        hi = mx.where(go_right, hi, mid)
+
+    return lo
+
+
 class UMAP:
     """UMAP dimensionality reduction using MLX on Metal GPU.
 
@@ -189,35 +211,39 @@ class UMAP:
 
         # Symmetrize: P = A + A^T - A * A^T
 
-        # For each edge (r,c), find reverse edge (c,r)
-        # Encode edges as single int for matching: r * n + c
-        fwd_keys = rows.astype(np.int64) * n + cols.astype(np.int64)
-        rev_keys = cols.astype(np.int64) * n + rows.astype(np.int64)
+        # For each edge (r,c), find reverse edge (c,r) -- all on MLX GPU
+        rows_mx = mx.array(rows)
+        cols_mx = mx.array(cols)
+        vals_mx = mx.array(vals)
+
+        # Encode edges as single int: r * n + c
+        fwd_keys = rows_mx.astype(mx.int64) * n + cols_mx.astype(mx.int64)
+        rev_keys = cols_mx.astype(mx.int64) * n + rows_mx.astype(mx.int64)
 
         # Sort forward keys for binary search
-        sort_idx = np.argsort(fwd_keys)
-        sorted_keys_np = fwd_keys[sort_idx]
-        sorted_vals_np = vals[sort_idx]
+        sort_idx = mx.argsort(fwd_keys)
+        sorted_keys = fwd_keys[sort_idx]
+        sorted_vals = vals_mx[sort_idx]
 
-        # Find reverse weights via searchsorted
-        pos_np = np.searchsorted(sorted_keys_np, rev_keys)
-        vals_np = vals
+        # Find reverse weights via GPU searchsorted
+        pos = _searchsorted(sorted_keys, rev_keys)
+        pos = mx.minimum(pos, sorted_keys.shape[0] - 1)
+        matched = sorted_keys[pos] == rev_keys
+        w_rev = mx.where(matched, sorted_vals[pos], 0.0)
 
-        pos_np = np.clip(pos_np, 0, len(sorted_keys_np) - 1)
-        matched = sorted_keys_np[pos_np] == rev_keys
-        w_rev = np.where(matched, sorted_vals_np[pos_np], 0.0).astype(np.float32)
+        # Symmetrize: P = A + A^T - A * A^T
+        w_sym = vals_mx + w_rev - vals_mx * w_rev
 
-        # Symmetrize
-        w_sym = vals_np + w_rev - vals_np * w_rev
-
-        # Prune weak edges
-        threshold = w_sym.max() / self.n_epochs
-        mask = w_sym >= threshold
-
+        # Prune weak edges and extract (MLX has no boolean indexing)
+        threshold = mx.max(w_sym) / self.n_epochs
+        mx.eval(w_sym, threshold)
+        mask_np = np.array(w_sym >= threshold)
+        active = np.nonzero(mask_np)[0].astype(np.int32)
+        active_mx = mx.array(active)
         return (
-            mx.array(rows[mask]),
-            mx.array(cols[mask]),
-            mx.array(w_sym[mask]),
+            rows_mx[active_mx],
+            cols_mx[active_mx],
+            w_sym[active_mx],
         )
 
     @staticmethod
