@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "umap-mlx"
+version = "0.1.0"
+description = "Pure MLX implementation of UMAP for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mlx>=0.20.0",
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "umap-learn>=0.5.0",
+    "matplotlib>=3.5.0",
+    "scikit-learn>=1.0.0",
+]
