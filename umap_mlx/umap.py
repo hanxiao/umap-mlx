@@ -34,7 +34,7 @@ class UMAP:
         n_neighbors: Number of nearest neighbors (default 15).
         min_dist: Minimum distance in low-dimensional space (default 0.1).
         spread: Effective scale of embedded points (default 1.0).
-        n_epochs: Number of optimization epochs (default 200).
+        n_epochs: Number of optimization epochs (default: 500 for N<=10K, 200 for larger).
         learning_rate: SGD learning rate (default 1.0).
         negative_sample_rate: Negative samples per positive edge (default 5).
         random_state: Random seed for reproducibility.
@@ -47,7 +47,7 @@ class UMAP:
         n_neighbors: int = 15,
         min_dist: float = 0.1,
         spread: float = 1.0,
-        n_epochs: int = 200,
+        n_epochs: int | None = None,
         learning_rate: float = 1.0,
         negative_sample_rate: int = 5,
         random_state: int | None = None,
@@ -83,12 +83,16 @@ class UMAP:
             print("Computing nearest neighbors...")
         knn_indices, knn_dists = self._compute_knn(X)
 
-        # Step 2: Fuzzy simplicial set
+        # Step 2: auto epochs (same as umap-learn: 500 for N<=10K, 200 otherwise)
+        if self.n_epochs is None:
+            self.n_epochs = 500 if n <= 10000 else 200
+
+        # Step 3: Fuzzy simplicial set
         if self.verbose:
             print("Building fuzzy simplicial set...")
         graph_rows, graph_cols, graph_vals = self._fuzzy_simplicial_set(knn_indices, knn_dists, n)
 
-        # Step 3: a/b parameters
+        # Step 4: a/b parameters
         a, b = self._find_ab_params(self.spread, self.min_dist)
 
         # Step 4: Initialize
