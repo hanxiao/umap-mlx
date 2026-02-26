@@ -248,22 +248,19 @@ class UMAP:
             neg_grad_coeff = 2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_pow))
             neg_grad = mx.clip(neg_grad_coeff * neg_diff, -4.0, 4.0)
 
-            # Apply updates: since MLX doesn't have scatter_add,
-            # convert to numpy for the accumulation step only
-            mx.eval(pos_grad, neg_grad)
-            Y_np = np.array(Y)
-            ef_np = np.array(ef)
-            et_np = np.array(et)
-            neg_from_np = np.array(neg_from_idx)
+            # scatter_add via indicator matrix + matmul (pure MLX, no numpy)
+            # indicator[i, j] = 1 if index[j] == i, then result = indicator @ grads
+            arange_n = mx.arange(n)
 
-            pos_np = np.array(pos_grad)
-            neg_np = np.array(neg_grad)
+            # Positive: Y[ef] += alpha * pos_grad, Y[et] -= alpha * pos_grad
+            ind_from = (arange_n[:, None] == ef[None, :]).astype(mx.float32)
+            ind_to = (arange_n[:, None] == et[None, :]).astype(mx.float32)
+            Y = Y + alpha_epoch * (ind_from @ pos_grad - ind_to @ pos_grad)
 
-            np.add.at(Y_np, ef_np, alpha_epoch * pos_np)
-            np.add.at(Y_np, et_np, -alpha_epoch * pos_np)
-            np.add.at(Y_np, neg_from_np, alpha_epoch * neg_np)
+            # Negative: Y[neg_from] += alpha * neg_grad
+            ind_neg = (arange_n[:, None] == neg_from_idx[None, :]).astype(mx.float32)
+            Y = Y + alpha_epoch * (ind_neg @ neg_grad)
 
-            Y = mx.array(Y_np)
             mx.eval(Y)
 
             epochs_per_next[active] += epochs_per_sample[active]
