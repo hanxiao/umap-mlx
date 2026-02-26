@@ -122,9 +122,9 @@ class UMAP:
         sum_sq = mx.sum(X_mx * X_mx, axis=1)
         mx.eval(sum_sq)
 
-        # Process in chunks to avoid OOM on very large datasets
-        # Each chunk: (chunk_size, n) distance matrix
-        chunk_size = min(n, max(1000, 500_000_000 // (n * 4)))  # ~2GB per chunk
+        # Process in chunks to control GPU memory
+        # Each chunk: (chunk_size, n) distance matrix, ~2GB per chunk
+        chunk_size = min(n, max(1000, 500_000_000 // (n * 4)))
         knn_indices = np.zeros((n, k), dtype=np.int32)
         knn_dists = np.zeros((n, k), dtype=np.float32)
 
@@ -324,7 +324,6 @@ class UMAP:
             for iteration in range(100):
                 # Multiply: V = A_norm @ V
                 V = sparse_matvec(V)
-                mx.eval(V)
 
                 # QR orthogonalization via modified Gram-Schmidt
                 for j in range(k):
@@ -333,7 +332,9 @@ class UMAP:
                         V = V.at[:, j].add(-proj * V[:, i])
                     norm = mx.sqrt(mx.sum(V[:, j] * V[:, j]) + 1e-10)
                     V = V.at[:, j].multiply(1.0 / norm)
-                    mx.eval(V)
+
+                # Eval once per iteration (not per column)
+                mx.eval(V)
 
             # Skip first eigenvector (constant), take next n_components
             embedding = V[:, 1:k]
@@ -356,16 +357,40 @@ class UMAP:
                 print(f"Spectral init failed ({e}), using random initialization")
             return mx.random.normal((n, self.n_components)) * (10.0 if n > 10000 else 0.01)
 
+    @staticmethod
+    def _sgd_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a, b):
+        """Single SGD step -- compiled for GPU fusion."""
+        # Positive forces (attract)
+        y_from = Y[ef]
+        y_to = Y[et]
+        diff = y_from - y_to
+        dist_sq = mx.maximum(mx.sum(diff * diff, axis=1, keepdims=True), 1e-6)
+
+        pow_val = mx.power(dist_sq, b)
+        grad_coeff = -2.0 * a * b * mx.power(dist_sq, b - 1.0) / (1.0 + a * pow_val)
+        pos_grad = mx.clip(grad_coeff * diff, -4.0, 4.0) * alpha_epoch
+
+        # Negative forces (repel)
+        y_neg_from = Y[neg_from_idx]
+        y_neg_to = Y[neg_to_idx]
+        neg_diff = y_neg_from - y_neg_to
+        neg_dist_sq = mx.maximum(mx.sum(neg_diff * neg_diff, axis=1, keepdims=True), 1e-6)
+
+        neg_pow = mx.power(neg_dist_sq, b)
+        neg_grad_coeff = 2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_pow))
+        neg_grad = mx.clip(neg_grad_coeff * neg_diff, -4.0, 4.0) * alpha_epoch
+
+        # Scatter updates
+        Y = Y.at[ef].add(pos_grad)
+        Y = Y.at[et].add(-pos_grad)
+        Y = Y.at[neg_from_idx].add(neg_grad)
+        return Y
+
     def _optimize(
         self, edge_from: mx.array, edge_to: mx.array, edge_weights: mx.array,
         Y: mx.array, a: float, b: float, n: int
     ) -> mx.array:
-        """Pure MLX SGD optimization on Metal GPU.
-
-        Uses fancy indexing (last-write-wins) instead of scatter_add.
-        SGD is stochastic by nature, so dropped updates from index
-        collisions act as implicit learning rate reduction.
-        """
+        """Pure MLX SGD optimization on Metal GPU with compiled step."""
         # Compute epochs_per_sample (scheduling only, stays in numpy)
         mx.eval(edge_weights)
         max_weight = float(mx.max(edge_weights).item())
@@ -375,9 +400,14 @@ class UMAP:
         epochs_per_next = epochs_per_sample.copy()
 
         alpha = self.learning_rate
+        # Wrap a/b as mx.array to avoid recompilation on each call
+        a_mx = mx.array(a)
+        b_mx = mx.array(b)
+        # Compile the SGD step for GPU kernel fusion
+        compiled_step = mx.compile(self._sgd_step)
 
         for epoch in range(self.n_epochs):
-            alpha_epoch = alpha * (1.0 - epoch / self.n_epochs)
+            alpha_epoch = mx.array(alpha * (1.0 - epoch / self.n_epochs))
 
             # Active edges (scheduling in numpy)
             active = np.where(epochs_per_next <= epoch)[0]
@@ -389,40 +419,12 @@ class UMAP:
             et = edge_to[active_mx]
             n_active = len(active)
 
-            # === All gradient computation on Metal GPU ===
-
-            # Positive forces (attract)
-            y_from = Y[ef]
-            y_to = Y[et]
-            diff = y_from - y_to
-            dist_sq = mx.maximum(mx.sum(diff * diff, axis=1, keepdims=True), 1e-6)
-
-            pow_val = mx.power(dist_sq, b)
-            grad_coeff = -2.0 * a * b * mx.power(dist_sq, b - 1.0) / (1.0 + a * pow_val)
-            pos_grad = mx.clip(grad_coeff * diff, -4.0, 4.0) * alpha_epoch
-
-            # Negative sampling
+            # Negative sampling indices
             n_neg = self.negative_sample_rate * n_active
             neg_from_idx = ef[mx.arange(n_neg) % n_active]
             neg_to_idx = mx.random.randint(0, n, (n_neg,))
 
-            y_neg_from = Y[neg_from_idx]
-            y_neg_to = Y[neg_to_idx]
-            neg_diff = y_neg_from - y_neg_to
-            neg_dist_sq = mx.maximum(mx.sum(neg_diff * neg_diff, axis=1, keepdims=True), 1e-6)
-
-            neg_pow = mx.power(neg_dist_sq, b)
-            neg_grad_coeff = 2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_pow))
-            neg_grad = mx.clip(neg_grad_coeff * neg_diff, -4.0, 4.0) * alpha_epoch
-
-            # Apply updates via fancy indexing (last-write-wins)
-            # For duplicate indices, only one update survives per index.
-            # This is acceptable: SGD is stochastic, and umap-learn's
-            # original C++ code also processes edges sequentially.
-            Y = Y.at[ef].add(pos_grad)
-            Y = Y.at[et].add(-pos_grad)
-            Y = Y.at[neg_from_idx].add(neg_grad)
-
+            Y = compiled_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a_mx, b_mx)
             mx.eval(Y)
 
             epochs_per_next[active] += epochs_per_sample[active]
