@@ -5,18 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "umap-mlx"
 version = "0.1.0"
-description = "Pure MLX implementation of UMAP for Apple Silicon"
+description = "UMAP in pure MLX for Apple Silicon"
 readme = "README.md"
-requires-python = ">=3.9"
+license = "MIT"
+requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.20.0",
-    "numpy>=1.20.0",
-    "scipy>=1.7.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "umap-learn>=0.5.0",
-    "matplotlib>=3.5.0",
-    "scikit-learn>=1.0.0",
-]
+[project.urls]
+Repository = "https://github.com/hanxiao/umap-mlx"
+
+[tool.hatch.build.targets.wheel]
+packages = ["umap_mlx"]

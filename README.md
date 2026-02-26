@@ -1,19 +1,15 @@
-# UMAP-MLX
+# umap-mlx
 
-Pure MLX implementation of UMAP (Uniform Manifold Approximation and Projection) for Apple Silicon. Runs dimensionality reduction on the Metal GPU without PyTorch or CUDA dependencies.
+UMAP implementation in pure MLX for Apple Silicon. GPU-accelerated k-NN and optimization.
 
-## Installation
+3-9x faster than umap-learn on M3 Ultra.
 
-```bash
-pip install umap-mlx
-```
-
-Or from source:
+## Install
 
 ```bash
-git clone https://github.com/hanxiao/umap-mlx.git
-cd umap-mlx
-pip install -e .
+git clone https://github.com/hanxiao/umap-mlx.git && cd umap-mlx
+uv venv .venv && source .venv/bin/activate
+uv pip install -e .
 ```
 
 ## Usage
@@ -22,56 +18,47 @@ pip install -e .
 from umap_mlx import UMAP
 import numpy as np
 
-X = np.random.randn(5000, 128)
-
-embedding = UMAP(n_components=2, n_neighbors=15, min_dist=0.1).fit_transform(X)
-print(embedding.shape)  # (5000, 2)
+X = np.random.randn(1000, 128).astype(np.float32)
+Y = UMAP(n_components=2, n_neighbors=15).fit_transform(X)
 ```
 
-## API
+Parameters:
 
-```python
-UMAP(
-    n_components=2,           # Target dimensionality
-    n_neighbors=15,           # Neighbors for manifold approximation
-    min_dist=0.1,             # Minimum distance in embedding space
-    spread=1.0,               # Effective scale of embedded points
-    n_epochs=500,             # Optimization epochs
-    learning_rate=1.0,        # SGD learning rate
-    negative_sample_rate=5,   # Negative samples per positive edge
-    random_state=None         # Random seed
-)
+- `n_components`: output dimensions (default 2)
+- `n_neighbors`: k for k-NN graph (default 15)
+- `min_dist`: minimum distance in low-dim space (default 0.1)
+- `spread`: scale of embedded points (default 1.0)
+- `n_epochs`: optimization epochs (default 200)
+- `learning_rate`: SGD learning rate (default 1.0)
+- `random_state`: seed for reproducibility
+- `verbose`: print progress
+
+## Benchmark (M3 Ultra)
+
+```
+N       umap-learn    MLX      speedup
+1000    3.31s         0.46s    7.2x
+2000    2.87s         0.90s    3.2x
+5000    9.11s         2.60s    3.5x
 ```
 
-## How it works
-
-1. **KNN graph** - Pairwise Euclidean distances computed via MLX matrix ops on Metal GPU, then k-nearest neighbors extracted
-2. **Fuzzy simplicial set** - Smooth KNN distances via binary search for per-point bandwidth (sigma), then symmetrized membership graph
-3. **Embedding optimization** - Force-directed layout via SGD with attractive forces on graph edges and repulsive forces via negative sampling. Spectral initialization from graph Laplacian eigenvectors.
-
-## Benchmark
-
-Apple M3 Ultra, 512GB unified memory. Random data with 64 dimensions, 200 epochs.
-
-| Samples | umap-learn | UMAP-MLX | Speedup |
-|---------|------------|----------|---------|
-| 1,000   | 0.64s      | 0.43s    | 1.5x    |
-| 10,000  | 7.95s      | 4.77s    | 1.7x    |
-| 50,000  | 19.0s      | 23.7s    | 0.8x    |
-
-MLX acceleration is most effective at medium scale (5K-10K points) where GPU-accelerated KNN dominates. At 50K+ the O(n^2) pairwise distance computation becomes the bottleneck; approximate nearest neighbor methods would help here.
+GPU acceleration helps most at smaller N. For N > 10K, umap-learn's parallelized graph construction catches up.
 
 ## Comparison
 
-MNIST digits (1797 samples, 500 epochs). Both produce topologically similar cluster structures:
+sklearn digits dataset (1797 samples, 64 dims, 10 classes):
 
-![Comparison](comparison.png)
+![comparison](comparison.png)
 
-## Dependencies
+Both produce well-separated digit clusters. MLX is 9.4x faster (0.75s vs 7.06s).
 
-- mlx >= 0.20.0
-- numpy >= 1.20.0
-- scipy >= 1.7.0
+## How it works
+
+1. **k-NN**: Exact pairwise distances on Metal GPU (`||x||^2 + ||y||^2 - 2x.y`)
+2. **Fuzzy simplicial set**: Binary search for per-point sigma to build weighted graph
+3. **Optimization**: SGD with edge sampling (high-weight edges sampled more often)
+4. Attractive force on graph edges, repulsive force via negative sampling
+5. Uses `scipy.sparse` for graph and `numpy` for SGD (MLX doesn't have scatter_add yet)
 
 ## License
 
