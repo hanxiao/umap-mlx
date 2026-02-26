@@ -86,91 +86,122 @@ class UMAP:
         return self.embedding_
 
     def _compute_knn(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Exact k-nearest neighbors using pairwise distances on GPU."""
-        X_mx = mx.array(X)
-        sum_sq = mx.sum(X_mx * X_mx, axis=1)
-        D = mx.maximum(sum_sq[:, None] + sum_sq[None, :] - 2.0 * (X_mx @ X_mx.T), 0.0)
-        mx.eval(D)
+        """Exact k-nearest neighbors, entirely on Metal GPU.
 
-        D_np = np.array(D)
+        Uses chunked distance computation to handle large datasets,
+        with mx.argpartition + mx.argsort for top-k selection.
+        """
         n = X.shape[0]
         k = self.n_neighbors
+        X_mx = mx.array(X)
+        sum_sq = mx.sum(X_mx * X_mx, axis=1)
+        mx.eval(sum_sq)
 
-        np.fill_diagonal(D_np, np.inf)
-        indices = np.argpartition(D_np, k, axis=1)[:, :k]
-        row_idx = np.arange(n)[:, None]
-        knn_dists_sq = D_np[row_idx, indices]
-        sort_order = np.argsort(knn_dists_sq, axis=1)
-        knn_indices = np.take_along_axis(indices, sort_order, axis=1).astype(np.int32)
-        knn_dists = np.sqrt(np.maximum(
-            np.take_along_axis(knn_dists_sq, sort_order, axis=1), 0
-        )).astype(np.float32)
+        # Process in chunks to avoid OOM on very large datasets
+        # Each chunk: (chunk_size, n) distance matrix
+        chunk_size = min(n, max(1000, 500_000_000 // (n * 4)))  # ~2GB per chunk
+        knn_indices = np.zeros((n, k), dtype=np.int32)
+        knn_dists = np.zeros((n, k), dtype=np.float32)
+
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            X_chunk = X_mx[start:end]
+            sum_sq_chunk = sum_sq[start:end]
+
+            # Pairwise distances: chunk vs all
+            D_chunk = mx.maximum(
+                sum_sq_chunk[:, None] + sum_sq[None, :] - 2.0 * (X_chunk @ X_mx.T),
+                0.0
+            )
+
+            # Set self-distance to inf
+            # Create mask for diagonal block
+            if end - start == n:
+                D_chunk = D_chunk + mx.eye(n) * 1e30
+            else:
+                arange_chunk = mx.arange(start, end)[:, None]
+                arange_all = mx.arange(n)[None, :]
+                self_mask = (arange_chunk == arange_all).astype(mx.float32)
+                D_chunk = D_chunk + self_mask * 1e30
+
+            # Top-k on GPU: argpartition then sort within k
+            top_k_idx = mx.argpartition(D_chunk, kth=k, axis=1)[:, :k]
+            top_k_dists = mx.take_along_axis(D_chunk, top_k_idx, axis=1)
+            sort_order = mx.argsort(top_k_dists, axis=1)
+            sorted_idx = mx.take_along_axis(top_k_idx, sort_order, axis=1)
+            sorted_dists = mx.take_along_axis(top_k_dists, sort_order, axis=1)
+
+            mx.eval(sorted_idx, sorted_dists)
+
+            knn_indices[start:end] = np.array(sorted_idx).astype(np.int32)
+            knn_dists[start:end] = np.sqrt(np.maximum(np.array(sorted_dists), 0)).astype(np.float32)
 
         return knn_indices, knn_dists
 
     def _fuzzy_simplicial_set(
         self, knn_indices: np.ndarray, knn_dists: np.ndarray, n: int
     ) -> tuple[mx.array, mx.array, mx.array]:
-        """Build fuzzy simplicial set. Returns (rows, cols, vals) as MLX arrays."""
+        """Build fuzzy simplicial set. Vectorized binary search for sigma."""
         k = self.n_neighbors
         target = np.log2(k)
 
-        sigmas = np.zeros(n, dtype=np.float32)
-        rhos = np.zeros(n, dtype=np.float32)
+        # Vectorized rho: nearest non-zero distance per point
+        mask = knn_dists > 0
+        rhos = np.where(mask.any(axis=1),
+                        np.where(mask, knn_dists, np.inf).min(axis=1),
+                        0).astype(np.float32)
+        rhos = np.maximum(rhos, 1e-8)
 
-        for i in range(n):
-            dists = knn_dists[i]
-            rhos[i] = max(dists[dists > 0].min(), 1e-8) if np.any(dists > 0) else 0
+        # Vectorized binary search for sigma (all points simultaneously)
+        lo = np.full(n, 1e-20, dtype=np.float64)
+        hi = np.full(n, 1e3, dtype=np.float64)
+        sigma = np.ones(n, dtype=np.float64)
+        dists_shifted = np.maximum(knn_dists - rhos[:, None], 0).astype(np.float64)
 
-            lo, hi = 1e-20, 1e3
-            sigma = 1.0
-            for _ in range(64):
-                vals = np.exp(-np.maximum(dists - rhos[i], 0) / sigma)
-                vals_sum = vals.sum()
-                if abs(vals_sum - target) < 1e-5:
-                    break
-                if vals_sum > target:
-                    hi = sigma
-                    sigma = (lo + hi) / 2
-                else:
-                    lo = sigma
-                    sigma = sigma * 2 if hi >= 1e3 else (lo + hi) / 2
-            sigmas[i] = sigma
+        for _ in range(64):
+            vals = np.exp(-dists_shifted / sigma[:, None])
+            vals_sum = vals.sum(axis=1)
 
-        # Build graph edges
-        rows = np.zeros(n * k, dtype=np.int32)
-        cols = np.zeros(n * k, dtype=np.int32)
-        vals = np.zeros(n * k, dtype=np.float32)
+            converged = np.abs(vals_sum - target) < 1e-5
+            too_high = vals_sum > target
+            too_low = ~too_high & ~converged
 
-        idx = 0
-        for i in range(n):
-            for j_idx in range(k):
-                j = int(knn_indices[i, j_idx])
-                d = max(knn_dists[i, j_idx] - rhos[i], 0)
-                w = np.exp(-d / max(sigmas[i], 1e-10))
-                rows[idx] = i
-                cols[idx] = j
-                vals[idx] = w
-                idx += 1
+            # Update bounds
+            lo = np.where(too_high & ~converged, sigma, lo)
+            new_hi_sigma = (lo + hi) / 2
+            hi_capped = np.where(hi >= 1e3, sigma * 2, new_hi_sigma)
+            hi = np.where(too_low, sigma, hi)
 
-        # Symmetrize: build dense, symmetrize, extract edges
-        # P = A + A^T - A * A^T
-        W = np.zeros((n, n), dtype=np.float32)
-        for e in range(idx):
-            W[rows[e], cols[e]] = vals[e]
+            sigma = np.where(too_high & ~converged, np.where(hi < 1e3, (sigma + hi) / 2, sigma * 2), sigma)
+            sigma = np.where(too_low, (sigma + lo) / 2, sigma)
 
-        W_sym = W + W.T - W * W.T
+            if converged.all():
+                break
 
-        # Prune weak edges (same as umap-learn)
-        max_val = W_sym.max()
-        W_sym[W_sym < max_val / self.n_epochs] = 0.0
+        sigma = sigma.astype(np.float32)
 
-        # Extract non-zero edges
-        nz = np.nonzero(W_sym)
+        # Vectorized edge weights
+        d_shifted = np.maximum(knn_dists - rhos[:, None], 0)
+        weights = np.exp(-d_shifted / np.maximum(sigma[:, None], 1e-10))
+
+        # Build sparse graph (vectorized)
+        rows = np.repeat(np.arange(n, dtype=np.int32), k)
+        cols = knn_indices.ravel().astype(np.int32)
+        vals = weights.ravel().astype(np.float32)
+
+        # Symmetrize using sparse ops
+        from scipy.sparse import coo_matrix
+        W = coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
+        W_T = W.T
+        W_sym = W + W_T - W.multiply(W_T)
+        W_sym = W_sym.tocoo()
+
+        # Prune weak edges
+        mask = W_sym.data >= W_sym.data.max() / self.n_epochs
         return (
-            mx.array(nz[0].astype(np.int32)),
-            mx.array(nz[1].astype(np.int32)),
-            mx.array(W_sym[nz].astype(np.float32)),
+            mx.array(W_sym.row[mask].astype(np.int32)),
+            mx.array(W_sym.col[mask].astype(np.int32)),
+            mx.array(W_sym.data[mask].astype(np.float32)),
         )
 
     @staticmethod
