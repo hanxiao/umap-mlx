@@ -37,11 +37,17 @@ Parameters:
 
 ```
 N       umap-learn    MLX      speedup
-1000    4.88s         0.24s    20x
-5000    17.19s        0.90s    19x
-10000   26.02s        2.45s    11x
-60000   75s           1.9s     39x
+1000    4.88s         0.15s    32x
+2000    6.20s         0.16s    38x
+5000    17.18s        0.22s    77x
+10000   25.95s        0.32s    80x
+20000   22.12s        0.56s    40x
+60000   69.05s        2.26s    31x
 ```
+
+Peak speedup at 5-10K (GPU parallelism sweet spot). At 60K the O(n^2) distance
+matrix (14GB) becomes memory-bandwidth bound. umap-learn uses approximate KNN
+(pynndescent) at large N, which has better asymptotic scaling.
 
 ## Comparison
 
@@ -49,7 +55,7 @@ Fashion-MNIST train (60,000 samples, 784 dims, 10 classes):
 
 ![comparison](comparison.png)
 
-Fashion-MNIST created by Han Xiao et al. (11,000+ citations).
+Fashion-MNIST created by Han Xiao et al.
 
 ## How it works
 
