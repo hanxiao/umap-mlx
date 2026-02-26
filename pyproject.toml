@@ -12,7 +12,6 @@ requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.20.0",
     "numpy>=1.26.0",
-    "scipy>=1.11.0",
 ]
 
 [project.urls]

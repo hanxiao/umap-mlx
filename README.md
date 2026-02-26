@@ -58,7 +58,7 @@ Both produce well-separated digit clusters. MLX is 9.4x faster (0.75s vs 7.06s).
 2. **Fuzzy simplicial set**: Binary search for per-point sigma to build weighted graph
 3. **Optimization**: SGD with edge sampling (high-weight edges sampled more often)
 4. Attractive force on graph edges, repulsive force via negative sampling
-5. Uses `scipy.sparse` for graph and `numpy` for SGD (MLX doesn't have scatter_add yet)
+5. No scipy dependency: graph built with numpy, gradient computation on MLX GPU, scatter accumulation via numpy (MLX lacks scatter_add)
 
 ## License
 
