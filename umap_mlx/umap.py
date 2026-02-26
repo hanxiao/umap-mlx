@@ -163,17 +163,19 @@ class UMAP:
             vals_sum = vals.sum(axis=1)
 
             converged = np.abs(vals_sum - target) < 1e-5
-            too_high = vals_sum > target
-            too_low = ~too_high & ~converged
+            # too_high means sigma is too large (too many effective neighbors)
+            too_high = (vals_sum > target) & ~converged
+            # too_low means sigma is too small
+            too_low = (vals_sum < target) & ~converged
 
-            # Update bounds
-            lo = np.where(too_high & ~converged, sigma, lo)
-            new_hi_sigma = (lo + hi) / 2
-            hi_capped = np.where(hi >= 1e3, sigma * 2, new_hi_sigma)
-            hi = np.where(too_low, sigma, hi)
+            # When sum too high: reduce sigma (set hi = sigma)
+            hi = np.where(too_high, sigma, hi)
+            # When sum too low: increase sigma (set lo = sigma)
+            lo = np.where(too_low, sigma, lo)
 
-            sigma = np.where(too_high & ~converged, np.where(hi < 1e3, (sigma + hi) / 2, sigma * 2), sigma)
-            sigma = np.where(too_low, (sigma + lo) / 2, sigma)
+            # New sigma: midpoint or double if boundary not yet found
+            sigma = np.where(too_high, (lo + sigma) / 2, sigma)
+            sigma = np.where(too_low, np.where(hi >= 1e3, sigma * 2, (sigma + hi) / 2), sigma)
 
             if converged.all():
                 break
