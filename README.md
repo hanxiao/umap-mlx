@@ -1,8 +1,8 @@
 # umap-mlx
 
-UMAP implementation in pure MLX for Apple Silicon. GPU-accelerated k-NN and optimization.
+UMAP in pure MLX for Apple Silicon. Entire pipeline runs on Metal GPU.
 
-3-9x faster than umap-learn on M3 Ultra.
+10-20x faster than umap-learn on small-to-medium datasets. Competitive on 60K.
 
 ## Install
 
@@ -33,34 +33,33 @@ Parameters:
 - `random_state`: seed for reproducibility
 - `verbose`: print progress
 
-## Benchmark (M3 Ultra)
+## Performance (M3 Ultra, Fashion-MNIST)
 
 ```
 N       umap-learn    MLX      speedup
-1000    3.31s         0.46s    7.2x
-2000    2.87s         0.90s    3.2x
-5000    9.11s         2.60s    3.5x
+1000    4.88s         0.24s    20.5x
+5000    17.19s        0.90s    19.1x
+10000   26.02s        2.45s    10.6x
+60000   75s           62s      1.2x
 ```
-
-GPU acceleration helps most at smaller N. For N > 10K, umap-learn's parallelized graph construction catches up.
 
 ## Comparison
 
-Fashion-MNIST (10K samples, 784 dims, 10 classes):
+Fashion-MNIST train (60,000 samples, 784 dims, 10 classes):
 
 ![comparison](comparison.png)
-
-Both produce well-separated clusters with clear class structure.
 
 Fashion-MNIST created by Han Xiao et al. (11,000+ citations).
 
 ## How it works
 
-1. **k-NN**: Exact pairwise distances on Metal GPU (`||x||^2 + ||y||^2 - 2x.y`)
-2. **Fuzzy simplicial set**: Binary search for per-point sigma to build weighted graph
-3. **Optimization**: SGD with edge sampling (high-weight edges sampled more often)
-4. Attractive force on graph edges, repulsive force via negative sampling
-5. No scipy dependency: graph built with numpy, gradient computation on MLX GPU, scatter accumulation via numpy (MLX lacks scatter_add)
+1. k-NN via exact pairwise distances on Metal GPU
+2. Fuzzy simplicial set with binary search for per-point sigma
+3. Edge pruning: remove weights < max/n_epochs (matches umap-learn)
+4. SGD on Metal GPU using `mx.array.at[].add()` for scatter accumulation
+5. Negative sampling with repulsive forces
+
+Dependencies: `mlx`, `numpy` only. No scipy, no PyTorch.
 
 ## License
 
