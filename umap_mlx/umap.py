@@ -128,6 +128,12 @@ class UMAP:
         knn_indices = np.zeros((n, k), dtype=np.int32)
         knn_dists = np.zeros((n, k), dtype=np.float32)
 
+        # Pipeline: build next chunk's distance while sorting current chunk
+        prev_idx = None
+        prev_dists = None
+        prev_start = None
+        prev_end = None
+
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             X_chunk = X_mx[start:end]
@@ -140,7 +146,6 @@ class UMAP:
             )
 
             # Set self-distance to inf
-            # Create mask for diagonal block
             if end - start == n:
                 D_chunk = D_chunk + mx.eye(n) * 1e30
             else:
@@ -149,17 +154,26 @@ class UMAP:
                 self_mask = (arange_chunk == arange_all).astype(mx.float32)
                 D_chunk = D_chunk + self_mask * 1e30
 
-            # Top-k on GPU: argpartition then sort within k
-            top_k_idx = mx.argpartition(D_chunk, kth=k, axis=1)[:, :k]
-            top_k_dists = mx.take_along_axis(D_chunk, top_k_idx, axis=1)
-            sort_order = mx.argsort(top_k_dists, axis=1)
-            sorted_idx = mx.take_along_axis(top_k_idx, sort_order, axis=1)
-            sorted_dists = mx.take_along_axis(top_k_dists, sort_order, axis=1)
+            # Top-k on GPU
+            sorted_all = mx.argsort(D_chunk, axis=1)[:, :k]
+            sorted_dists = mx.take_along_axis(D_chunk, sorted_all, axis=1)
 
-            mx.eval(sorted_idx, sorted_dists)
+            # Collect previous chunk results while current computes
+            if prev_idx is not None:
+                mx.eval(prev_idx, prev_dists)
+                knn_indices[prev_start:prev_end] = np.array(prev_idx).astype(np.int32)
+                knn_dists[prev_start:prev_end] = np.sqrt(np.maximum(np.array(prev_dists), 0)).astype(np.float32)
 
-            knn_indices[start:end] = np.array(sorted_idx).astype(np.int32)
-            knn_dists[start:end] = np.sqrt(np.maximum(np.array(sorted_dists), 0)).astype(np.float32)
+            prev_idx = sorted_all
+            prev_dists = sorted_dists
+            prev_start = start
+            prev_end = end
+
+        # Collect last chunk
+        if prev_idx is not None:
+            mx.eval(prev_idx, prev_dists)
+            knn_indices[prev_start:prev_end] = np.array(prev_idx).astype(np.int32)
+            knn_dists[prev_start:prev_end] = np.sqrt(np.maximum(np.array(prev_dists), 0)).astype(np.float32)
 
         return knn_indices, knn_dists
 
@@ -391,7 +405,7 @@ class UMAP:
         Y: mx.array, a: float, b: float, n: int
     ) -> mx.array:
         """Pure MLX SGD optimization on Metal GPU with compiled step."""
-        # Compute epochs_per_sample (scheduling only, stays in numpy)
+        # Pre-compute epoch scheduling (avoid per-epoch np.where)
         mx.eval(edge_weights)
         max_weight = float(mx.max(edge_weights).item())
         weights_np = np.array(edge_weights)
@@ -399,35 +413,35 @@ class UMAP:
         epochs_per_sample = np.where(n_samples > 0, self.n_epochs / n_samples, -1.0)
         epochs_per_next = epochs_per_sample.copy()
 
+        # Pre-compute active edge sets for all epochs
+        active_sets = []
+        for epoch in range(self.n_epochs):
+            active = np.where(epochs_per_next <= epoch)[0]
+            active_sets.append(mx.array(active.astype(np.int32)) if len(active) > 0 else None)
+            if len(active) > 0:
+                epochs_per_next[active] += epochs_per_sample[active]
+
         alpha = self.learning_rate
-        # Wrap a/b as mx.array to avoid recompilation on each call
         a_mx = mx.array(a)
         b_mx = mx.array(b)
-        # Compile the SGD step for GPU kernel fusion
-        compiled_step = mx.compile(self._sgd_step)
 
         for epoch in range(self.n_epochs):
-            alpha_epoch = mx.array(alpha * (1.0 - epoch / self.n_epochs))
-
-            # Active edges (scheduling in numpy)
-            active = np.where(epochs_per_next <= epoch)[0]
-            if len(active) == 0:
+            if active_sets[epoch] is None:
                 continue
 
-            active_mx = mx.array(active.astype(np.int32))
+            active_mx = active_sets[epoch]
             ef = edge_from[active_mx]
             et = edge_to[active_mx]
-            n_active = len(active)
+            n_active = active_mx.shape[0]
+            alpha_epoch = mx.array(alpha * (1.0 - epoch / self.n_epochs))
 
             # Negative sampling indices
             n_neg = self.negative_sample_rate * n_active
             neg_from_idx = ef[mx.arange(n_neg) % n_active]
             neg_to_idx = mx.random.randint(0, n, (n_neg,))
 
-            Y = compiled_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a_mx, b_mx)
+            Y = self._sgd_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a_mx, b_mx)
             mx.eval(Y)
-
-            epochs_per_next[active] += epochs_per_sample[active]
 
             if self.verbose and (epoch + 1) % 50 == 0:
                 print(f"Epoch {epoch + 1}/{self.n_epochs}")
