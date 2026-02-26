@@ -100,27 +100,19 @@ class UMAP:
         # Get k+1 nearest (including self), then exclude self
         D_np = np.array(D)
         k = self.n_neighbors
-        indices = np.argpartition(D_np, k + 1, axis=1)[:, : k + 1]
-
-        # Sort by distance within the k+1
         n = X.shape[0]
-        knn_indices = np.zeros((n, k), dtype=np.int32)
-        knn_dists = np.zeros((n, k), dtype=np.float32)
 
-        for i in range(n):
-            idx = indices[i]
-            dists = D_np[i, idx]
-            order = np.argsort(dists)
-            # Skip self (distance 0)
-            neighbors = []
-            for j in order:
-                if idx[j] != i:
-                    neighbors.append((idx[j], dists[j]))
-                if len(neighbors) == k:
-                    break
-            for j, (ni, di) in enumerate(neighbors):
-                knn_indices[i, j] = ni
-                knn_dists[i, j] = np.sqrt(max(di, 0))
+        # Set diagonal to inf so self is never a neighbor
+        np.fill_diagonal(D_np, np.inf)
+
+        # argpartition for top-k, then sort within
+        indices = np.argpartition(D_np, k, axis=1)[:, :k]
+        # Gather distances and sort
+        row_idx = np.arange(n)[:, None]
+        knn_dists_sq = D_np[row_idx, indices]
+        sort_order = np.argsort(knn_dists_sq, axis=1)
+        knn_indices = np.take_along_axis(indices, sort_order, axis=1).astype(np.int32)
+        knn_dists = np.sqrt(np.maximum(np.take_along_axis(knn_dists_sq, sort_order, axis=1), 0)).astype(np.float32)
 
         return knn_indices, knn_dists
 
