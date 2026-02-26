@@ -191,19 +191,33 @@ class UMAP:
         cols = knn_indices.ravel().astype(np.int32)
         vals = weights.ravel().astype(np.float32)
 
-        # Symmetrize using sparse ops
-        from scipy.sparse import coo_matrix
-        W = coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
-        W_T = W.T
-        W_sym = W + W_T - W.multiply(W_T)
-        W_sym = W_sym.tocoo()
+        # Symmetrize: P = A + A^T - A * A^T (no scipy)
+        # Use dict-based sparse representation
+        edge_dict = {}
+        for i in range(len(rows)):
+            edge_dict[(rows[i], cols[i])] = vals[i]
+
+        sym_edges = {}
+        for (r, c), w in edge_dict.items():
+            w_rev = edge_dict.get((c, r), 0.0)
+            key = (r, c)
+            sym_edges[key] = w + w_rev - w * w_rev
 
         # Prune weak edges
-        mask = W_sym.data >= W_sym.data.max() / self.n_epochs
+        max_val = max(sym_edges.values()) if sym_edges else 1.0
+        threshold = max_val / self.n_epochs
+
+        out_rows, out_cols, out_vals = [], [], []
+        for (r, c), w in sym_edges.items():
+            if w >= threshold:
+                out_rows.append(r)
+                out_cols.append(c)
+                out_vals.append(w)
+
         return (
-            mx.array(W_sym.row[mask].astype(np.int32)),
-            mx.array(W_sym.col[mask].astype(np.int32)),
-            mx.array(W_sym.data[mask].astype(np.float32)),
+            mx.array(np.array(out_rows, dtype=np.int32)),
+            mx.array(np.array(out_cols, dtype=np.int32)),
+            mx.array(np.array(out_vals, dtype=np.float32)),
         )
 
     @staticmethod
@@ -232,39 +246,6 @@ class UMAP:
                     best_a, best_b, best_err = a, b, err
 
         return float(best_a), float(best_b)
-
-    def _spectral_init(self, rows, cols, vals, n):
-        """Spectral initialization using normalized graph Laplacian."""
-        try:
-            from scipy.sparse import coo_matrix
-            from scipy.sparse.linalg import eigsh
-
-            rows_np = np.array(rows)
-            cols_np = np.array(cols)
-            vals_np = np.array(vals)
-
-            W = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n)).tocsr()
-            # Normalized Laplacian: L = D^{-1/2} W D^{-1/2}
-            degrees = np.array(W.sum(axis=1)).flatten()
-            degrees = np.maximum(degrees, 1e-10)
-            D_inv_sqrt = 1.0 / np.sqrt(degrees)
-
-            # Compute eigenvectors of D^{-1/2} W D^{-1/2}
-            from scipy.sparse import diags
-            L_norm = diags(D_inv_sqrt) @ W @ diags(D_inv_sqrt)
-            _, eigvecs = eigsh(L_norm, k=self.n_components + 1, which='LM')
-            # Skip first eigenvector (constant), take next n_components
-            Y = eigvecs[:, 1:self.n_components + 1]
-            # Scale to unit variance
-            Y = Y / Y.std() * 0.0001
-
-            if self.verbose:
-                print("Using spectral initialization")
-            return mx.array(Y.astype(np.float32))
-        except Exception:
-            if self.verbose:
-                print("Spectral init failed, using random initialization")
-            return mx.random.normal((n, self.n_components)) * 0.01
 
     def _optimize(
         self, edge_from: mx.array, edge_to: mx.array, edge_weights: mx.array,

@@ -65,7 +65,7 @@ Fashion-MNIST created by Han Xiao et al.
 4. SGD on Metal GPU using `mx.array.at[].add()` for scatter accumulation
 5. Negative sampling with repulsive forces
 
-Dependencies: `mlx`, `numpy`, `scipy` (sparse graph ops).
+Dependencies: `mlx` and `numpy` only. No scipy, no PyTorch.
 
 ## License
 
