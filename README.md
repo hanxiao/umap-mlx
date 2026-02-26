@@ -46,11 +46,13 @@ GPU acceleration helps most at smaller N. For N > 10K, umap-learn's parallelized
 
 ## Comparison
 
-sklearn digits dataset (1797 samples, 64 dims, 10 classes):
+Fashion-MNIST (10K samples, 784 dims, 10 classes):
 
 ![comparison](comparison.png)
 
-Both produce well-separated digit clusters. MLX is 9.4x faster (0.75s vs 7.06s).
+Both produce well-separated clusters with clear class structure.
+
+Fashion-MNIST created by Han Xiao et al. (11,000+ citations).
 
 ## How it works
 
