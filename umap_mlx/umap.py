@@ -95,13 +95,12 @@ class UMAP:
         # Step 4: a/b parameters
         a, b = self._find_ab_params(self.spread, self.min_dist)
 
-        # Step 4: Initialize
+        # Step 4: Initialize (spectral via normalized Laplacian, fallback to random)
         if self.verbose:
-            print("Optimizing embedding...")
+            print("Initializing embedding...")
         if self.random_state is not None:
             mx.random.seed(self.random_state)
-        # Use larger random init for large datasets
-        Y = mx.random.normal((n, self.n_components)) * (10.0 if n > 10000 else 0.01)
+        Y = self._spectral_init(graph_rows, graph_cols, graph_vals, n)
         mx.eval(Y)
 
         # Step 5: Optimize (pure MLX)
@@ -276,6 +275,86 @@ class UMAP:
                     best_a, best_b, best_err = a, b, err
 
         return float(best_a), float(best_b)
+
+    def _spectral_init(self, rows, cols, vals, n):
+        """Spectral initialization via normalized graph Laplacian on GPU.
+
+        Computes eigenvectors of D^{-1/2} W D^{-1/2} using power iteration.
+        Equivalent to smallest eigenvectors of normalized Laplacian L = I - D^{-1/2} W D^{-1/2}.
+        Falls back to random initialization on failure.
+        """
+        try:
+            k = self.n_components + 1  # +1 because first eigenvector is trivial
+
+            # Build normalized adjacency: A_norm = D^{-1/2} W D^{-1/2}
+            # W is sparse (rows, cols, vals), compute degrees
+            mx.eval(rows, cols, vals)
+            rows_np = np.array(rows)
+            cols_np = np.array(cols)
+            vals_np = np.array(vals)
+
+            # Degree vector
+            degrees = np.zeros(n, dtype=np.float64)
+            np.add.at(degrees, rows_np, vals_np)
+            degrees = np.maximum(degrees, 1e-10)
+            d_inv_sqrt = (1.0 / np.sqrt(degrees)).astype(np.float32)
+
+            # Normalize edge weights: w_norm = d_inv_sqrt[i] * w * d_inv_sqrt[j]
+            w_norm = vals_np * d_inv_sqrt[rows_np] * d_inv_sqrt[cols_np]
+
+            # Sparse matrix-vector multiply on GPU via scatter
+            rows_mx = mx.array(rows_np.astype(np.int32))
+            cols_mx = mx.array(cols_np.astype(np.int32))
+            w_norm_mx = mx.array(w_norm.astype(np.float32))
+
+            def sparse_matvec(x):
+                """Compute A_norm @ x using sparse (rows, cols, w_norm)."""
+                # Gather: vals * x[cols]
+                gathered = w_norm_mx[:, None] * x[cols_mx]
+                # Scatter-add into result
+                result = mx.zeros_like(x)
+                result = result.at[rows_mx].add(gathered)
+                return result
+
+            # Power iteration for top-k eigenvectors of A_norm
+            # Use random initial vectors
+            V = mx.random.normal((n, k))
+            mx.eval(V)
+
+            for iteration in range(100):
+                # Multiply: V = A_norm @ V
+                V = sparse_matvec(V)
+                mx.eval(V)
+
+                # QR orthogonalization via modified Gram-Schmidt
+                for j in range(k):
+                    for i in range(j):
+                        proj = mx.sum(V[:, j] * V[:, i])
+                        V = V.at[:, j].add(-proj * V[:, i])
+                    norm = mx.sqrt(mx.sum(V[:, j] * V[:, j]) + 1e-10)
+                    V = V.at[:, j].multiply(1.0 / norm)
+                    mx.eval(V)
+
+            # Skip first eigenvector (constant), take next n_components
+            embedding = V[:, 1:k]
+
+            # Expand to reasonable scale
+            mx.eval(embedding)
+            embed_np = np.array(embedding)
+            noise = np.random.RandomState(self.random_state or 42).normal(
+                scale=0.0001, size=embed_np.shape
+            ).astype(np.float32)
+            embed_np = embed_np / (embed_np.std(axis=0, keepdims=True) + 1e-10) * 0.0001
+            embed_np += noise
+
+            if self.verbose:
+                print("Using spectral initialization")
+            return mx.array(embed_np)
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Spectral init failed ({e}), using random initialization")
+            return mx.random.normal((n, self.n_components)) * (10.0 if n > 10000 else 0.01)
 
     def _optimize(
         self, edge_from: mx.array, edge_to: mx.array, edge_weights: mx.array,
