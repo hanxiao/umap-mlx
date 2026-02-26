@@ -145,79 +145,79 @@ class UMAP:
         k = self.n_neighbors
         target = np.log2(k)
 
-        # Vectorized rho: nearest non-zero distance per point
-        mask = knn_dists > 0
-        rhos = np.where(mask.any(axis=1),
-                        np.where(mask, knn_dists, np.inf).min(axis=1),
-                        0).astype(np.float32)
-        rhos = np.maximum(rhos, 1e-8)
+        # Vectorized rho + binary search for sigma on MLX GPU
+        knn_dists_mx = mx.array(knn_dists)
 
-        # Vectorized binary search for sigma (all points simultaneously)
-        lo = np.full(n, 1e-20, dtype=np.float64)
-        hi = np.full(n, 1e3, dtype=np.float64)
-        sigma = np.ones(n, dtype=np.float64)
-        dists_shifted = np.maximum(knn_dists - rhos[:, None], 0).astype(np.float64)
+        # Rho: nearest non-zero distance per point
+        mask = knn_dists_mx > 0
+        rhos = mx.where(mask, knn_dists_mx, mx.array(float('inf')))
+        rhos = mx.maximum(mx.min(rhos, axis=1), mx.array(1e-8))
+        mx.eval(rhos)
+
+        # Binary search for sigma (all N points simultaneously on GPU)
+        lo = mx.full((n,), 1e-20)
+        hi = mx.full((n,), 1e3)
+        sigma = mx.ones((n,))
+        dists_shifted = mx.maximum(knn_dists_mx - rhos[:, None], 0.0)
 
         for _ in range(64):
-            vals = np.exp(-dists_shifted / sigma[:, None])
-            vals_sum = vals.sum(axis=1)
+            vals = mx.exp(-dists_shifted / sigma[:, None])
+            vals_sum = mx.sum(vals, axis=1)
 
-            converged = np.abs(vals_sum - target) < 1e-5
-            # too_high means sigma is too large (too many effective neighbors)
+            converged = mx.abs(vals_sum - target) < 1e-5
             too_high = (vals_sum > target) & ~converged
-            # too_low means sigma is too small
             too_low = (vals_sum < target) & ~converged
 
-            # When sum too high: reduce sigma (set hi = sigma)
-            hi = np.where(too_high, sigma, hi)
-            # When sum too low: increase sigma (set lo = sigma)
-            lo = np.where(too_low, sigma, lo)
+            hi = mx.where(too_high, sigma, hi)
+            lo = mx.where(too_low, sigma, lo)
 
-            # New sigma: midpoint or double if boundary not yet found
-            sigma = np.where(too_high, (lo + sigma) / 2, sigma)
-            sigma = np.where(too_low, np.where(hi >= 1e3, sigma * 2, (sigma + hi) / 2), sigma)
+            sigma = mx.where(too_high, (lo + sigma) / 2, sigma)
+            sigma = mx.where(too_low, mx.where(hi >= 1e3, sigma * 2, (sigma + hi) / 2), sigma)
 
-            if converged.all():
+            mx.eval(sigma)
+            if bool(mx.all(converged)):
                 break
 
-        sigma = sigma.astype(np.float32)
+        # Edge weights on GPU
+        weights = mx.exp(-dists_shifted / mx.maximum(sigma[:, None], 1e-10))
+        mx.eval(weights)
 
-        # Vectorized edge weights
-        d_shifted = np.maximum(knn_dists - rhos[:, None], 0)
-        weights = np.exp(-d_shifted / np.maximum(sigma[:, None], 1e-10))
-
-        # Build sparse graph (vectorized)
+        # Build sparse edges
         rows = np.repeat(np.arange(n, dtype=np.int32), k)
         cols = knn_indices.ravel().astype(np.int32)
-        vals = weights.ravel().astype(np.float32)
+        vals = np.array(weights.reshape(-1)).astype(np.float32)
 
-        # Symmetrize: P = A + A^T - A * A^T (no scipy)
-        # Use dict-based sparse representation
-        edge_dict = {}
-        for i in range(len(rows)):
-            edge_dict[(rows[i], cols[i])] = vals[i]
+        # Symmetrize: P = A + A^T - A * A^T
 
-        sym_edges = {}
-        for (r, c), w in edge_dict.items():
-            w_rev = edge_dict.get((c, r), 0.0)
-            key = (r, c)
-            sym_edges[key] = w + w_rev - w * w_rev
+        # For each edge (r,c), find reverse edge (c,r)
+        # Encode edges as single int for matching: r * n + c
+        fwd_keys = rows.astype(np.int64) * n + cols.astype(np.int64)
+        rev_keys = cols.astype(np.int64) * n + rows.astype(np.int64)
+
+        # Sort forward keys for binary search
+        sort_idx = np.argsort(fwd_keys)
+        sorted_keys_np = fwd_keys[sort_idx]
+        sorted_vals_np = vals[sort_idx]
+
+        # Find reverse weights via searchsorted
+        pos_np = np.searchsorted(sorted_keys_np, rev_keys)
+        vals_np = vals
+
+        pos_np = np.clip(pos_np, 0, len(sorted_keys_np) - 1)
+        matched = sorted_keys_np[pos_np] == rev_keys
+        w_rev = np.where(matched, sorted_vals_np[pos_np], 0.0).astype(np.float32)
+
+        # Symmetrize
+        w_sym = vals_np + w_rev - vals_np * w_rev
 
         # Prune weak edges
-        max_val = max(sym_edges.values()) if sym_edges else 1.0
-        threshold = max_val / self.n_epochs
-
-        out_rows, out_cols, out_vals = [], [], []
-        for (r, c), w in sym_edges.items():
-            if w >= threshold:
-                out_rows.append(r)
-                out_cols.append(c)
-                out_vals.append(w)
+        threshold = w_sym.max() / self.n_epochs
+        mask = w_sym >= threshold
 
         return (
-            mx.array(np.array(out_rows, dtype=np.int32)),
-            mx.array(np.array(out_cols, dtype=np.int32)),
-            mx.array(np.array(out_vals, dtype=np.float32)),
+            mx.array(rows[mask]),
+            mx.array(cols[mask]),
+            mx.array(w_sym[mask]),
         )
 
     @staticmethod
