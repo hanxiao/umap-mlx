@@ -11,3 +11,5 @@ build/
 .DS_Store
 
 *.npy
+video_data*.npz
+comparison_video*.mp4
