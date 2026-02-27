@@ -63,11 +63,11 @@ Fashion-MNIST full (70,000 samples, 784 dims, 10 classes):
 
 Spectral initialization:
 
-![init](comparison_init.png)
+![init](comparison_init.png?raw=true)
 
 After optimization:
 
-![comparison](comparison.png)
+![comparison](comparison.png?raw=true)
 
 ## How it works
 
