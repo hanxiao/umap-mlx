@@ -6,9 +6,7 @@ UMAP in pure MLX for Apple Silicon. Entire pipeline runs on Metal GPU.
 
 
 
-https://github.com/user-attachments/assets/edf6ad13-570b-429f-9078-b130cda15dfd
-
-
+https://github.com/user-attachments/assets/e7677d25-6a14-46c5-afff-55311989dccc
 
 
 
