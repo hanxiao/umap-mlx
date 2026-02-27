@@ -2,22 +2,18 @@
 
 import mlx.core as mx
 import numpy as np
+from functools import partial
 
 
 def _searchsorted(sorted_array: mx.array, values: mx.array) -> mx.array:
-    """Vectorized binary search on GPU (equivalent to np.searchsorted).
-
-    For each value in `values`, find the insertion index in `sorted_array`.
-    """
+    """Vectorized binary search on GPU (equivalent to np.searchsorted)."""
     n = sorted_array.shape[0]
     m = values.shape[0]
     lo = mx.zeros((m,), dtype=mx.int32)
     hi = mx.full((m,), n, dtype=mx.int32)
 
-    # ceil(log2(n)) iterations suffice
     for _ in range(int(np.ceil(np.log2(max(n, 2)))) + 1):
         mid = (lo + hi) // 2
-        # Clamp mid to valid range for indexing
         mid_clamped = mx.minimum(mid, n - 1)
         go_right = sorted_array[mid_clamped] < values
         lo = mx.where(go_right, mid + 1, lo)
@@ -64,38 +60,31 @@ class UMAP:
         self.verbose = verbose
         self.embedding_ = None
 
-    def fit_transform(self, X) -> np.ndarray:
+    def fit_transform(self, X, epoch_callback=None) -> np.ndarray:
         """Fit UMAP and return the embedding.
 
         Args:
-            X: Input data, shape (n_samples, n_features). np.ndarray or mx.array.
-
-        Returns:
-            Embedding as np.ndarray, shape (n_samples, n_components).
+            X: Input data, shape (n_samples, n_features).
+            epoch_callback: Optional callable(epoch, Y_numpy) for snapshots.
         """
         if isinstance(X, mx.array):
             X = np.array(X)
         X = np.asarray(X, dtype=np.float32)
         n = X.shape[0]
 
-        # Step 1: KNN on GPU
         if self.verbose:
             print("Computing nearest neighbors...")
         knn_indices, knn_dists = self._compute_knn(X)
 
-        # Step 2: auto epochs (same as umap-learn: 500 for N<=10K, 200 otherwise)
         if self.n_epochs is None:
             self.n_epochs = 500 if n <= 10000 else 200
 
-        # Step 3: Fuzzy simplicial set
         if self.verbose:
             print("Building fuzzy simplicial set...")
         graph_rows, graph_cols, graph_vals = self._fuzzy_simplicial_set(knn_indices, knn_dists, n)
 
-        # Step 4: a/b parameters
         a, b = self._find_ab_params(self.spread, self.min_dist)
 
-        # Step 4: Initialize (spectral via normalized Laplacian, fallback to random)
         if self.verbose:
             print("Initializing embedding...")
         if self.random_state is not None:
@@ -103,18 +92,17 @@ class UMAP:
         Y = self._spectral_init(graph_rows, graph_cols, graph_vals, n)
         mx.eval(Y)
 
-        # Step 5: Optimize (pure MLX)
-        Y = self._optimize(graph_rows, graph_cols, graph_vals, Y, a, b, n)
+        Y = self._optimize(graph_rows, graph_cols, graph_vals, Y, a, b, n,
+                           epoch_callback=epoch_callback)
         mx.eval(Y)
 
         self.embedding_ = np.array(Y)
         return self.embedding_
 
     def _compute_knn(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Exact k-nearest neighbors, entirely on Metal GPU.
+        """Exact k-nearest neighbors on Metal GPU.
 
-        Uses chunked distance computation to handle large datasets,
-        with mx.argpartition + mx.argsort for top-k selection.
+        Uses chunked pairwise distance computation with async pipeline.
         """
         n = X.shape[0]
         k = self.n_neighbors
@@ -122,24 +110,17 @@ class UMAP:
         sum_sq = mx.sum(X_mx * X_mx, axis=1)
         mx.eval(sum_sq)
 
-        # Process in chunks to control GPU memory
-        # Each chunk: (chunk_size, n) distance matrix, ~2GB per chunk
         chunk_size = min(n, max(1000, 500_000_000 // (n * 4)))
         knn_indices = np.zeros((n, k), dtype=np.int32)
         knn_dists = np.zeros((n, k), dtype=np.float32)
 
-        # Pipeline: build next chunk's distance while sorting current chunk
-        prev_idx = None
-        prev_dists = None
-        prev_start = None
-        prev_end = None
+        prev_idx = prev_dists = prev_start = prev_end = None
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             X_chunk = X_mx[start:end]
             sum_sq_chunk = sum_sq[start:end]
 
-            # Pairwise distances: chunk vs all
             D_chunk = mx.maximum(
                 sum_sq_chunk[:, None] + sum_sq[None, :] - 2.0 * (X_chunk @ X_mx.T),
                 0.0
@@ -151,25 +132,19 @@ class UMAP:
             else:
                 arange_chunk = mx.arange(start, end)[:, None]
                 arange_all = mx.arange(n)[None, :]
-                self_mask = (arange_chunk == arange_all).astype(mx.float32)
-                D_chunk = D_chunk + self_mask * 1e30
+                D_chunk = D_chunk + (arange_chunk == arange_all).astype(mx.float32) * 1e30
 
-            # Top-k on GPU
             sorted_all = mx.argsort(D_chunk, axis=1)[:, :k]
             sorted_dists = mx.take_along_axis(D_chunk, sorted_all, axis=1)
 
-            # Collect previous chunk results while current computes
+            # Pipeline: collect previous while current computes
             if prev_idx is not None:
                 mx.eval(prev_idx, prev_dists)
                 knn_indices[prev_start:prev_end] = np.array(prev_idx).astype(np.int32)
                 knn_dists[prev_start:prev_end] = np.sqrt(np.maximum(np.array(prev_dists), 0)).astype(np.float32)
 
-            prev_idx = sorted_all
-            prev_dists = sorted_dists
-            prev_start = start
-            prev_end = end
+            prev_idx, prev_dists, prev_start, prev_end = sorted_all, sorted_dists, start, end
 
-        # Collect last chunk
         if prev_idx is not None:
             mx.eval(prev_idx, prev_dists)
             knn_indices[prev_start:prev_end] = np.array(prev_idx).astype(np.int32)
@@ -180,27 +155,27 @@ class UMAP:
     def _fuzzy_simplicial_set(
         self, knn_indices: np.ndarray, knn_dists: np.ndarray, n: int
     ) -> tuple[mx.array, mx.array, mx.array]:
-        """Build fuzzy simplicial set. Vectorized binary search for sigma."""
+        """Build fuzzy simplicial set on GPU."""
         k = self.n_neighbors
         target = np.log2(k)
 
-        # Vectorized rho + binary search for sigma on MLX GPU
         knn_dists_mx = mx.array(knn_dists)
 
-        # Rho: nearest non-zero distance per point
+        # Rho: distance to nearest non-zero neighbor
         mask = knn_dists_mx > 0
         rhos = mx.where(mask, knn_dists_mx, mx.array(float('inf')))
         rhos = mx.maximum(mx.min(rhos, axis=1), mx.array(1e-8))
         mx.eval(rhos)
 
-        # Binary search for sigma (all N points simultaneously on GPU)
+        # Binary search for sigma (vectorized over all N points on GPU)
         lo = mx.full((n,), 1e-20)
         hi = mx.full((n,), 1e3)
         sigma = mx.ones((n,))
         dists_shifted = mx.maximum(knn_dists_mx - rhos[:, None], 0.0)
+        dists_shifted_tail = dists_shifted[:, 1:]  # skip j=0 (rho contributor)
 
         for _ in range(64):
-            vals = mx.exp(-dists_shifted / sigma[:, None])
+            vals = mx.exp(-dists_shifted_tail / sigma[:, None])
             vals_sum = mx.sum(vals, axis=1)
 
             converged = mx.abs(vals_sum - target) < 1e-5
@@ -209,159 +184,123 @@ class UMAP:
 
             hi = mx.where(too_high, sigma, hi)
             lo = mx.where(too_low, sigma, lo)
-
-            sigma = mx.where(too_high, (lo + sigma) / 2, sigma)
-            sigma = mx.where(too_low, mx.where(hi >= 1e3, sigma * 2, (sigma + hi) / 2), sigma)
+            sigma = mx.where(too_high, (lo + sigma) / 2.0, sigma)
+            sigma = mx.where(too_low, mx.where(hi >= 1e3, sigma * 2.0, (sigma + hi) / 2.0), sigma)
 
             mx.eval(sigma)
             if bool(mx.all(converged)):
                 break
 
-        # Edge weights on GPU
+        # Edge weights
         weights = mx.exp(-dists_shifted / mx.maximum(sigma[:, None], 1e-10))
         mx.eval(weights)
 
-        # Build sparse edges
-        rows = np.repeat(np.arange(n, dtype=np.int32), k)
-        cols = knn_indices.ravel().astype(np.int32)
-        vals = np.array(weights.reshape(-1)).astype(np.float32)
+        # Build sparse edges (rows/cols from numpy, vals from MLX)
+        rows_np = np.repeat(np.arange(n, dtype=np.int32), k)
+        cols_np = knn_indices.ravel().astype(np.int32)
+        rows_mx = mx.array(rows_np)
+        cols_mx = mx.array(cols_np)
+        vals_mx = weights.reshape(-1)
 
-        # Symmetrize: P = A + A^T - A * A^T
-
-        # For each edge (r,c), find reverse edge (c,r) -- all on MLX GPU
-        rows_mx = mx.array(rows)
-        cols_mx = mx.array(cols)
-        vals_mx = mx.array(vals)
-
-        # Encode edges as single int: r * n + c
+        # Symmetrize on GPU: P = A + A^T - A * A^T
         fwd_keys = rows_mx.astype(mx.int64) * n + cols_mx.astype(mx.int64)
         rev_keys = cols_mx.astype(mx.int64) * n + rows_mx.astype(mx.int64)
 
-        # Sort forward keys for binary search
         sort_idx = mx.argsort(fwd_keys)
         sorted_keys = fwd_keys[sort_idx]
         sorted_vals = vals_mx[sort_idx]
 
-        # Find reverse weights via GPU searchsorted
         pos = _searchsorted(sorted_keys, rev_keys)
         pos = mx.minimum(pos, sorted_keys.shape[0] - 1)
         matched = sorted_keys[pos] == rev_keys
         w_rev = mx.where(matched, sorted_vals[pos], 0.0)
 
-        # Symmetrize: P = A + A^T - A * A^T
         w_sym = vals_mx + w_rev - vals_mx * w_rev
 
-        # Prune weak edges and extract (MLX has no boolean indexing)
+        # Prune weak edges
         threshold = mx.max(w_sym) / self.n_epochs
         mx.eval(w_sym, threshold)
         mask_np = np.array(w_sym >= threshold)
         active = np.nonzero(mask_np)[0].astype(np.int32)
         active_mx = mx.array(active)
-        return (
-            rows_mx[active_mx],
-            cols_mx[active_mx],
-            w_sym[active_mx],
-        )
+        return rows_mx[active_mx], cols_mx[active_mx], w_sym[active_mx]
 
     @staticmethod
     def _find_ab_params(spread: float, min_dist: float) -> tuple[float, float]:
-        """Find a, b parameters via curve fitting (numpy only, no scipy)."""
-        # Levenberg-Marquardt is overkill; simple grid search + refinement
+        """Find a, b parameters via Gauss-Newton optimization (no scipy)."""
         xv = np.linspace(0, spread * 3, 300)
         yv = np.where(xv < min_dist, 1.0, np.exp(-(xv - min_dist) / spread))
 
-        best_a, best_b, best_err = 1.0, 1.0, float('inf')
+        a, b = 1.0, 1.0
+        for _ in range(100):
+            x2b = np.power(xv, 2 * b)
+            denom = 1.0 + a * x2b
+            pred = 1.0 / denom
+            residual = pred - yv
 
-        # Coarse grid
-        for a in np.linspace(0.1, 5.0, 50):
-            for b in np.linspace(0.1, 2.0, 20):
-                pred = 1.0 / (1.0 + a * np.power(xv, 2 * b))
-                err = np.sum((pred - yv) ** 2)
-                if err < best_err:
-                    best_a, best_b, best_err = a, b, err
+            da = -x2b / (denom * denom)
+            db = -a * 2.0 * np.log(np.maximum(xv, 1e-20)) * x2b / (denom * denom)
 
-        # Fine refinement
-        for a in np.linspace(max(best_a - 0.5, 0.01), best_a + 0.5, 100):
-            for b in np.linspace(max(best_b - 0.2, 0.01), best_b + 0.2, 40):
-                pred = 1.0 / (1.0 + a * np.power(xv, 2 * b))
-                err = np.sum((pred - yv) ** 2)
-                if err < best_err:
-                    best_a, best_b, best_err = a, b, err
+            J = np.column_stack([da, db])
+            step = np.linalg.lstsq(J, -residual, rcond=None)[0]
+            a += step[0]
+            b += step[1]
 
-        return float(best_a), float(best_b)
+            if np.sum(step ** 2) < 1e-12:
+                break
+
+        return float(a), float(b)
 
     def _spectral_init(self, rows, cols, vals, n):
-        """Spectral initialization via normalized graph Laplacian on GPU.
-
-        Computes eigenvectors of D^{-1/2} W D^{-1/2} using power iteration.
-        Equivalent to smallest eigenvectors of normalized Laplacian L = I - D^{-1/2} W D^{-1/2}.
-        Falls back to random initialization on failure.
-        """
+        """Spectral initialization via power iteration on normalized Laplacian (pure MLX)."""
         try:
-            k = self.n_components + 1  # +1 because first eigenvector is trivial
+            k = self.n_components + 1
 
-            # Build normalized adjacency: A_norm = D^{-1/2} W D^{-1/2}
-            # W is sparse (rows, cols, vals), compute degrees
             mx.eval(rows, cols, vals)
-            rows_np = np.array(rows)
-            cols_np = np.array(cols)
-            vals_np = np.array(vals)
 
-            # Degree vector
-            degrees = np.zeros(n, dtype=np.float64)
-            np.add.at(degrees, rows_np, vals_np)
-            degrees = np.maximum(degrees, 1e-10)
-            d_inv_sqrt = (1.0 / np.sqrt(degrees)).astype(np.float32)
+            # Compute degrees and normalize on GPU
+            # Scatter-add for degrees
+            degrees = mx.zeros((n,))
+            degrees = degrees.at[rows].add(vals)
+            mx.eval(degrees)
+            degrees = mx.maximum(degrees, 1e-10)
+            d_inv_sqrt = 1.0 / mx.sqrt(degrees)
 
-            # Normalize edge weights: w_norm = d_inv_sqrt[i] * w * d_inv_sqrt[j]
-            w_norm = vals_np * d_inv_sqrt[rows_np] * d_inv_sqrt[cols_np]
+            # Normalized edge weights
+            w_norm = vals * d_inv_sqrt[rows] * d_inv_sqrt[cols]
+            mx.eval(w_norm)
 
-            # Sparse matrix-vector multiply on GPU via scatter
-            rows_mx = mx.array(rows_np.astype(np.int32))
-            cols_mx = mx.array(cols_np.astype(np.int32))
-            w_norm_mx = mx.array(w_norm.astype(np.float32))
-
+            # Sparse matvec on GPU
             def sparse_matvec(x):
-                """Compute A_norm @ x using sparse (rows, cols, w_norm)."""
-                # Gather: vals * x[cols]
-                gathered = w_norm_mx[:, None] * x[cols_mx]
-                # Scatter-add into result
+                gathered = w_norm[:, None] * x[cols]
                 result = mx.zeros_like(x)
-                result = result.at[rows_mx].add(gathered)
+                result = result.at[rows].add(gathered)
                 return result
 
-            # Power iteration for top-k eigenvectors of A_norm
-            # Use random initial vectors
+            # Power iteration for top-k eigenvectors
             V = mx.random.normal((n, k))
             mx.eval(V)
 
-            for iteration in range(100):
-                # Multiply: V = A_norm @ V
+            for _ in range(100):
                 V = sparse_matvec(V)
-
-                # QR orthogonalization via modified Gram-Schmidt
+                # Modified Gram-Schmidt (batched eval)
                 for j in range(k):
                     for i in range(j):
                         proj = mx.sum(V[:, j] * V[:, i])
                         V = V.at[:, j].add(-proj * V[:, i])
                     norm = mx.sqrt(mx.sum(V[:, j] * V[:, j]) + 1e-10)
                     V = V.at[:, j].multiply(1.0 / norm)
-
-                # Eval once per iteration (not per column)
                 mx.eval(V)
 
-            # Skip first eigenvector (constant), take next n_components
             embedding = V[:, 1:k]
-
-            # Scale to [0, 10] + noise (matches umap-learn)
             mx.eval(embedding)
+
+            # Scale to [0, 10] + noise
             embed_np = np.array(embedding)
             rng = np.random.RandomState(self.random_state or 42)
-            # noisy_scale_coords: scale to [-max_coord, max_coord]
             expansion = 10.0 / np.max(np.abs(embed_np))
             embed_np = (embed_np * expansion).astype(np.float32)
             embed_np += rng.normal(scale=0.0001, size=embed_np.shape).astype(np.float32)
-            # Final normalization to [0, 10]
             embed_np = 10.0 * (embed_np - embed_np.min(axis=0)) / (embed_np.max(axis=0) - embed_np.min(axis=0) + 1e-10)
 
             if self.verbose:
@@ -371,11 +310,11 @@ class UMAP:
         except Exception as e:
             if self.verbose:
                 print(f"Spectral init failed ({e}), using random initialization")
-            return mx.random.normal((n, self.n_components)) * (10.0 if n > 10000 else 0.01)
+            return mx.random.normal((n, self.n_components)) * 0.01
 
     @staticmethod
     def _sgd_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a, b):
-        """Single SGD step -- compiled for GPU fusion."""
+        """Single SGD step -- pure MLX, ready for mx.compile."""
         # Positive forces (attract)
         y_from = Y[ef]
         y_to = Y[et]
@@ -396,7 +335,7 @@ class UMAP:
         neg_grad_coeff = 2.0 * b / ((0.001 + neg_dist_sq) * (1.0 + a * neg_pow))
         neg_grad = mx.clip(neg_grad_coeff * neg_diff, -4.0, 4.0) * alpha_epoch
 
-        # Scatter updates
+        # Scatter updates (move both head and tail)
         Y = Y.at[ef].add(pos_grad)
         Y = Y.at[et].add(-pos_grad)
         Y = Y.at[neg_from_idx].add(neg_grad)
@@ -404,10 +343,15 @@ class UMAP:
 
     def _optimize(
         self, edge_from: mx.array, edge_to: mx.array, edge_weights: mx.array,
-        Y: mx.array, a: float, b: float, n: int
+        Y: mx.array, a: float, b: float, n: int,
+        epoch_callback=None,
     ) -> mx.array:
-        """Pure MLX SGD optimization on Metal GPU with compiled step."""
-        # Pre-compute epoch scheduling (avoid per-epoch np.where)
+        """Pure MLX SGD optimization with pre-computed scheduling.
+
+        Args:
+            epoch_callback: Optional callable(epoch, Y_numpy) called after each epoch.
+                            Use for snapshots/animation. Y_numpy is a numpy copy.
+        """
         mx.eval(edge_weights)
         max_weight = float(mx.max(edge_weights).item())
         weights_np = np.array(edge_weights)
@@ -415,17 +359,22 @@ class UMAP:
         epochs_per_sample = np.where(n_samples > 0, self.n_epochs / n_samples, -1.0)
         epochs_per_next = epochs_per_sample.copy()
 
-        # Pre-compute active edge sets for all epochs
+        # Pre-compute active edge sets (all numpy work upfront)
         active_sets = []
         for epoch in range(self.n_epochs):
             active = np.where(epochs_per_next <= epoch)[0]
-            active_sets.append(mx.array(active.astype(np.int32)) if len(active) > 0 else None)
             if len(active) > 0:
                 epochs_per_next[active] += epochs_per_sample[active]
+                active_sets.append(mx.array(active.astype(np.int32)))
+            else:
+                active_sets.append(None)
 
-        alpha = self.learning_rate
         a_mx = mx.array(a)
         b_mx = mx.array(b)
+        alpha = self.learning_rate
+
+        if epoch_callback is not None:
+            epoch_callback(0, np.array(Y))
 
         for epoch in range(self.n_epochs):
             if active_sets[epoch] is None:
@@ -437,13 +386,16 @@ class UMAP:
             n_active = active_mx.shape[0]
             alpha_epoch = mx.array(alpha * (1.0 - epoch / self.n_epochs))
 
-            # Negative sampling indices
+            # Negative sampling: fixed rate per active edge (pure MLX)
             n_neg = self.negative_sample_rate * n_active
             neg_from_idx = ef[mx.arange(n_neg) % n_active]
             neg_to_idx = mx.random.randint(0, n, (n_neg,))
 
             Y = self._sgd_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a_mx, b_mx)
             mx.eval(Y)
+
+            if epoch_callback is not None:
+                epoch_callback(epoch + 1, np.array(Y))
 
             if self.verbose and (epoch + 1) % 50 == 0:
                 print(f"Epoch {epoch + 1}/{self.n_epochs}")

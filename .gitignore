@@ -11,4 +11,6 @@ build/
 .DS_Store
 
 *.npy
-video_data*.npz
+*.npz
+*.mp4
+*.png
