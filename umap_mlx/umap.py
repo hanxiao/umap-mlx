@@ -392,10 +392,12 @@ class UMAP:
             neg_to_idx = mx.random.randint(0, n, (n_neg,))
 
             Y = self._sgd_step(Y, ef, et, neg_from_idx, neg_to_idx, alpha_epoch, a_mx, b_mx)
-            mx.eval(Y)
 
             if epoch_callback is not None:
+                mx.eval(Y)
                 epoch_callback(epoch + 1, np.array(Y))
+            elif (epoch + 1) % 10 == 0 or epoch == self.n_epochs - 1:
+                mx.eval(Y)
 
             if self.verbose and (epoch + 1) % 50 == 0:
                 print(f"Epoch {epoch + 1}/{self.n_epochs}")
