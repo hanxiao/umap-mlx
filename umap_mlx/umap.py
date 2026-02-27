@@ -353,14 +353,16 @@ class UMAP:
             # Skip first eigenvector (constant), take next n_components
             embedding = V[:, 1:k]
 
-            # Expand to reasonable scale
+            # Scale to [0, 10] + noise (matches umap-learn)
             mx.eval(embedding)
             embed_np = np.array(embedding)
-            noise = np.random.RandomState(self.random_state or 42).normal(
-                scale=0.0001, size=embed_np.shape
-            ).astype(np.float32)
-            embed_np = embed_np / (embed_np.std(axis=0, keepdims=True) + 1e-10) * 0.0001
-            embed_np += noise
+            rng = np.random.RandomState(self.random_state or 42)
+            # noisy_scale_coords: scale to [-max_coord, max_coord]
+            expansion = 10.0 / np.max(np.abs(embed_np))
+            embed_np = (embed_np * expansion).astype(np.float32)
+            embed_np += rng.normal(scale=0.0001, size=embed_np.shape).astype(np.float32)
+            # Final normalization to [0, 10]
+            embed_np = 10.0 * (embed_np - embed_np.min(axis=0)) / (embed_np.max(axis=0) - embed_np.min(axis=0) + 1e-10)
 
             if self.verbose:
                 print("Using spectral initialization")
