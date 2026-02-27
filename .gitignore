@@ -12,4 +12,3 @@ build/
 
 *.npy
 video_data*.npz
-comparison_video*.mp4
