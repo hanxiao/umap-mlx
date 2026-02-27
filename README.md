@@ -4,6 +4,8 @@ UMAP in pure MLX for Apple Silicon. Entire pipeline runs on Metal GPU.
 
 30-46x faster than umap-learn. Fashion-MNIST 70K in 2.6 seconds.
 
+<video src="https://github.com/hanxiao/umap-mlx/releases/download/v0.1.0/comparison_video_70k.mp4" controls autoplay loop muted width="100%"></video>
+
 ## Install
 
 ```bash
@@ -54,8 +56,6 @@ uses approximate KNN (pynndescent) with better asymptotic scaling.
 Fashion-MNIST full (70,000 samples, 784 dims, 10 classes):
 
 ![comparison](comparison.png)
-
-Fashion-MNIST created by Han Xiao et al.
 
 ## How it works
 
