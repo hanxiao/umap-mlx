@@ -61,6 +61,12 @@ uses approximate KNN (pynndescent) with better asymptotic scaling.
 
 Fashion-MNIST full (70,000 samples, 784 dims, 10 classes):
 
+Spectral initialization:
+
+![init](comparison_init.png)
+
+After optimization:
+
 ![comparison](comparison.png)
 
 ## How it works
