@@ -2,11 +2,12 @@
 
 UMAP in pure MLX for Apple Silicon. Entire pipeline runs on Metal GPU.
 
-30-46x faster than umap-learn. Fashion-MNIST 70K in 2.6 seconds.
+30-46x faster than umap-learn. Fashion-MNIST 70K in 3.4 seconds for 500 epochs.
 
 
 
-https://github.com/user-attachments/assets/e7677d25-6a14-46c5-afff-55311989dccc
+https://github.com/user-attachments/assets/1e0bf0ca-0d4b-43ba-9e97-14e1e0fc0a4c
+
 
 
 
