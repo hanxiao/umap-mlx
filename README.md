@@ -106,6 +106,10 @@ The 500-epoch Python loop cannot be collapsed into a single kernel because
 Metal lacks global barriers across threadgroups -- each epoch's scatter-add
 must complete before the next epoch reads Y.
 
+## See also
+
+- [pacmap-mlx](https://github.com/hanxiao/pacmap-mlx) -- PaCMAP in pure MLX. Same idea, different algorithm: uses 3 pair types (near/mid-near/far) with phase-scheduled weights instead of fuzzy graphs. Often better at preserving global structure.
+
 ## License
 
 MIT
