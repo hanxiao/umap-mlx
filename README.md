@@ -78,6 +78,33 @@ After optimization:
 
 Dependencies: `mlx` and `numpy` only. No scipy, no PyTorch.
 
+## Possible future directions
+
+**Approximate KNN via NNDescent.** Current exact KNN computes O(n^2) pairwise
+distances, which dominates runtime at large N (e.g. 2.0s of 3.3s at 70K).
+NNDescent builds an approximate k-NN graph in O(n log n) by iteratively
+improving neighbors through neighbor-of-neighbor exploration. The challenge
+is that NNDescent is inherently iterative with random access patterns
+(heap operations, conditional updates per candidate), which maps poorly to
+GPU SIMD execution. umap-learn's implementation is 1500 lines of Numba JIT.
+A practical MLX version would need to replace heaps with fixed-size sorted
+buffers and batch the neighbor-of-neighbor lookups as matrix gathers.
+Likely only worthwhile above 100K+ samples where the O(n^2) distance matrix
+exceeds memory.
+
+**Custom Metal kernel for SGD.** The optimization loop currently dispatches
+~10 separate MLX operations per epoch (gather, subtract, multiply, power,
+clip, scatter-add x3), each as an independent Metal kernel. A fused Metal
+shader via `mx.fast.metal_kernel()` could handle one edge per thread: read
+Y[head] and Y[tail], compute the gradient in registers, and atomic-add the
+update back to Y. This eliminates intermediate buffer allocations and reduces
+kernel dispatch overhead from ~5000 launches to ~500 (one per epoch). Metal 3.0
+supports `atomic_fetch_add_explicit` for float on all Apple Silicon. Estimated
+improvement: ~10% on total runtime (SGD portion from 1.3s to ~1.0s at 70K).
+The 500-epoch Python loop cannot be collapsed into a single kernel because
+Metal lacks global barriers across threadgroups -- each epoch's scatter-add
+must complete before the next epoch reads Y.
+
 ## License
 
 MIT
