@@ -35,6 +35,9 @@ class UMAP:
         negative_sample_rate: Negative samples per positive edge (default 5).
         random_state: Random seed for reproducibility.
         verbose: Print progress.
+        pca_dim: PCA preprocessing dimension (default None = no PCA).
+            Set to e.g. 100 to reduce high-dimensional inputs before KNN.
+            Reduces curse of dimensionality and speeds up distance computation.
     """
 
     def __init__(
@@ -48,6 +51,7 @@ class UMAP:
         negative_sample_rate: int = 5,
         random_state: int | None = None,
         verbose: bool = False,
+        pca_dim: int | None = None,
     ):
         self.n_components = n_components
         self.n_neighbors = n_neighbors
@@ -58,6 +62,7 @@ class UMAP:
         self.negative_sample_rate = negative_sample_rate
         self.random_state = random_state
         self.verbose = verbose
+        self.pca_dim = pca_dim
         self.embedding_ = None
 
     def fit_transform(self, X, epoch_callback=None) -> np.ndarray:
@@ -70,11 +75,35 @@ class UMAP:
         if isinstance(X, mx.array):
             X = np.array(X)
         X = np.asarray(X, dtype=np.float32)
-        n = X.shape[0]
+        n, dim = X.shape
+
+        # Optional PCA preprocessing for high-dimensional data
+        if self.pca_dim is not None and dim > self.pca_dim:
+            if self.verbose:
+                print(f"Applying PCA: {dim} -> {self.pca_dim} dims...")
+            X_mx = mx.array(X)
+            mean = mx.mean(X_mx, axis=0)
+            X_centered = X_mx - mean
+            cov = (X_centered.T @ X_centered) / (n - 1)
+            mx.eval(cov)
+            eigvals, eigvecs = mx.linalg.eigh(cov, stream=mx.cpu)
+            mx.eval(eigvals, eigvecs)
+            # Take top pca_dim components (eigh returns ascending order)
+            proj = eigvecs[:, -self.pca_dim:][:, ::-1]
+            X_pca = X_centered @ proj
+            mx.eval(X_pca)
+            X_for_knn = np.array(X_pca)
+            if self.verbose:
+                # Report variance retained
+                total_var = mx.sum(eigvals).item()
+                retained_var = mx.sum(eigvals[-self.pca_dim:]).item()
+                print(f"Variance retained: {retained_var/total_var*100:.1f}%")
+        else:
+            X_for_knn = X
 
         if self.verbose:
             print("Computing nearest neighbors...")
-        knn_indices, knn_dists = self._compute_knn(X)
+        knn_indices, knn_dists = self._compute_knn(X_for_knn)
 
         if self.n_epochs is None:
             self.n_epochs = 500 if n <= 10000 else 200
@@ -350,7 +379,6 @@ class UMAP:
 
         Args:
             epoch_callback: Optional callable(epoch, Y_numpy) called after each epoch.
-                            Use for snapshots/animation. Y_numpy is a numpy copy.
         """
         mx.eval(edge_weights)
         max_weight = float(mx.max(edge_weights).item())
